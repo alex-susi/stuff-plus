@@ -1,0 +1,737 @@
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(brms)
+library(mgcv)
+library(broom)
+library(lme4)
+library(tibble)
+library(reshape2)
+library(caret)
+library(purrr)
+library(tibble)
+library(ParBayesianOptimization)
+library(xgboost)
+library(SHAPforxgboost)
+
+
+
+pitch_data <- read.csv("pitch_data.csv") %>%
+  mutate(pitch_id = row_number()) %>%
+  relocate(pitch_id, .before = everything())
+
+re_288 <- read.csv("re288.csv")
+
+
+
+
+
+## Data Cleaning and Feature Engineering ----------------------------------
+pitch_data_clean <- pitch_data %>%
+  
+  # Imputing Missing Spin Rates by Pitcher and Pitch Type
+  mutate(spin_rate = as.numeric(ifelse(spin_rate == "NULL", 
+                                       NA, spin_rate))) %>%
+  group_by(pitcherid, pitch_type) %>%
+  mutate(spin_rate = ifelse(is.na(spin_rate), 
+                            mean(spin_rate, na.rm = TRUE), 
+                            spin_rate)) %>%
+  ungroup() %>%
+  as.data.frame() %>%
+  
+  # Impute Missing Spin Rates by Pitch Type
+  group_by(pitch_type) %>%
+  mutate(spin_rate = ifelse(is.na(spin_rate), 
+                            mean(spin_rate, na.rm = TRUE), 
+                            spin_rate)) %>%
+  ungroup() %>%
+  as.data.frame() %>%
+  
+  
+  
+  # Feature Engineering
+  mutate(
+    
+    
+    # Detect new game when umpired ID changes
+    new_game = ifelse(lag(hp_umpid, 
+                          default = first(hp_umpid)) != hp_umpid,
+                      1, 0),
+    
+    # Assign a game_id
+    game_id = cumsum(new_game) + 1,
+    
+    # Converting existing variables to factors
+    across(c(is_swing, is_bottom, is_lhp, is_lhb, pitch_type, 
+             batterid, pitcherid, cid, hp_umpid), 
+           as.factor),
+    
+    batter_platoon_adv = as.factor(ifelse(is_lhp != is_lhb, 1, 0)),
+    
+    
+    # Attack Zone
+    attack_zone = 'waste',
+    attack_zone = case_when(
+      plate_location_x >= -0.558 & 
+        plate_location_x <= 0.558 & 
+        plate_location_z >= 1.833 & 
+        plate_location_z <= 3.166 ~ 'heart',
+      plate_location_x >= -1.108 & 
+        plate_location_x <= 1.108 & 
+        plate_location_z >= 1.166 & 
+        plate_location_z <= 3.833 & 
+        attack_zone != 'heart' ~ 'shadow',
+      plate_location_x >= -1.666 & 
+        plate_location_x <= 1.666 & 
+        plate_location_z >= 0.5 & 
+        plate_location_z <= 4.5 & 
+        !attack_zone %in% c('heart', 'shadow') ~ 'chase',
+      TRUE ~ attack_zone),
+    
+    
+    # Game State
+    basecode_before = case_when(
+      basecode_before == 0 ~ "000",
+      basecode_before == 1 ~ "100",
+      basecode_before == 2 ~ "010",
+      basecode_before == 3 ~ "110",
+      basecode_before == 4 ~ "001",
+      basecode_before == 5 ~ "101",
+      basecode_before == 6 ~ "011",
+      basecode_before == 7 ~ "111"
+    ),
+    
+    Outs_baseState = as.factor(paste(outs_before, 
+                                     basecode_before, 
+                                     sep = "_")),
+    
+    count = paste0("X", balls, ".", strikes),
+    
+    batting_team_diff = bat_score_before - field_score,
+    
+    inning_stage = case_when(
+      inning <= 3 ~ "early",
+      inning <= 6 ~ "middle",
+      TRUE ~ "late"  
+    ),
+    
+    
+    
+    # Features for opposite call
+    opp_is_strike = case_when(
+      is_strike == 1 & is_swing == 0 ~ 0,
+      is_strike == 0 & is_swing == 0 ~ 1,
+      TRUE ~ is_strike
+    ),
+    
+    # Update count based on if the opposite call was made
+    opp_count_after = case_when(
+      opp_is_strike == 0 & balls < 3 ~ 
+        paste(balls + 1, strikes, sep = "-"),
+      opp_is_strike == 1 & strikes < 2 ~ 
+        paste(balls, strikes + 1, sep = "-"),
+      TRUE ~ paste(0, 0, sep = "-")
+    ),
+    
+    # Update the outs if the opposite call would result in a strikeout
+    opp_outs_after = if_else(opp_is_strike == 1 & strikes == 2,
+                             outs_before + 1, outs_before),
+    
+    # Inning-ending situation when outs reach 3 due to a strikeout 
+    # in the opposite call scenario
+    opp_inning_end = opp_outs_after >= 3,
+    
+    # Adjust the base state if the opposite call result in a walk 
+    opp_base_state_after = case_when(
+      opp_is_strike == 0 & balls == 3 ~ case_when(
+        basecode_before == "000" ~ "100",  # Walk, runner to 1st
+        basecode_before == "100" ~ "110",  # Walk, runners on 1st and 2nd
+        basecode_before == "010" ~ "110",  # Walk, runners on 1st and 2nd
+        basecode_before == "110" ~ "111",  # Walk, bases loaded
+        basecode_before == "001" ~ "101",  # Walk, runners on 1st and 3rd
+        basecode_before == "101" ~ "111",  # Walk, bases loaded
+        basecode_before == "011" ~ "111",  # Walk, bases loaded
+        basecode_before == "111" ~ "111",  # Walk, bases loaded
+        TRUE ~ basecode_before
+      ),
+      TRUE ~ basecode_before
+    ),
+    
+    # Check if a run would have been scored if a walk with bases loaded
+    opp_runs_scored = case_when(
+      opp_is_strike == 0 & balls == 3 & basecode_before == "111" ~ 1,
+      TRUE ~ 0
+    ),
+    
+    # New Outs-base state combination for run expectancy calculation
+    opp_outs_base_state_after = paste0(opp_outs_after, "_",
+                                       opp_base_state_after)
+    ) %>%
+  
+  
+  
+  
+  # Mapping to Run Expectancy matrix
+  left_join(re_288, by = "Outs_baseState") %>%
+  rowwise() %>%
+  mutate(run_exp_before = get(count),
+         opp_run_exp_after = if_else(
+           opp_inning_end == TRUE, 0,
+           get(paste0("X", gsub("-", ".", opp_count_after))))
+         ) %>%
+  ungroup() %>%
+  select(-c(starts_with("X"))) %>%
+  mutate(count = gsub("^X", "", count),  
+         count = gsub("\\.", "-", count),
+         count = as.factor(count)) %>%
+  
+  
+  group_by(game_id, inning, is_bottom) %>%
+  mutate(
+    # Detect if score changes between the current and next pitch
+    bat_score_after = lead(bat_score_before,
+                           default = bat_score_before[n()]),  
+    
+    
+    # Assign runs if there is a score change
+    runs_scored = ifelse(bat_score_after > bat_score_before, 
+                         bat_score_after - bat_score_before, 0),
+    
+    run_exp_after = lead(run_exp_before, default = 0),
+    
+    pitch_run_value = run_exp_after - run_exp_before + runs_scored,
+    opp_pitch_run_value = opp_run_exp_after - run_exp_before + 
+      opp_runs_scored) %>% 
+  ungroup() %>%
+  
+  relocate(starts_with("opp"), .after = everything()) %>%
+  
+  rowwise() %>%
+  mutate(
+    leverage_index = (sd(c(pitch_run_value, opp_pitch_run_value)))
+  ) %>%
+  ungroup() %>%  
+  
+    
+  filter(is_swing == 0) %>%
+  as.data.frame()
+
+
+
+
+
+
+
+
+
+
+
+## Exploring the Data -----------------------------------------------------
+# Called Strike Percentages by Zone
+pitch_data_clean %>%
+  group_by(attack_zone, is_strike) %>%
+  summarize(called_strike_prob = round(mean(is_strike), 4) * 100,
+            n = n()) %>%
+  arrange(desc(attack_zone)) %>%
+  as.data.frame()
+
+# Called Strike Percentages by Zone and Count
+pitch_data_clean %>%
+  group_by(attack_zone, count) %>%
+  summarize(called_strike_prob = round(mean(is_strike), 4)*100,
+            n = n()) %>%
+  arrange(attack_zone, desc(called_strike_prob)) %>%
+  as.data.frame()
+
+
+pitch_data_clean %>%
+  group_by(attack_zone, balls) %>%
+  summarize(called_strike_prob = round(mean(is_strike), 4)*100,
+            n = n()) %>%
+  arrange(attack_zone, desc(called_strike_prob)) %>%
+  as.data.frame()
+
+# Called Strike Percentages by Zone and Batter/Pitcher Handedness
+pitch_data_clean %>%
+  group_by(attack_zone, is_lhb, is_lhp) %>%
+  summarize(called_strike_prob = round(mean(is_strike), 4)*100,
+            n = n()) %>%
+  arrange(attack_zone, desc(called_strike_prob)) %>%
+  as.data.frame()
+
+
+
+pitch_data_clean %>%
+  filter(basecode_before == "111") %>%
+  filter(balls == 3) %>%
+  filter(strikes == 2) %>%
+  filter(outs_before == 2) %>%
+  arrange(desc(leverage_index)) %>%
+  head()
+
+pitch_data_clean %>%
+  filter(is_strike == 0) %>%
+  filter(balls == 3) %>%
+  #filter(outs_before == 2) %>%
+  head()
+
+pitch_data_clean %>%
+  arrange(desc(leverage_index)) %>%
+  filter(is_swing == 0) %>%
+  head()
+
+
+
+
+
+
+
+
+
+## Attack Zone Plot -------------------------------------------------------
+attack_zone_plot <- ggplot(pitch_data_clean,
+                           aes(x = plate_location_x,
+                               y = plate_location_z,
+                               z = is_strike)) + 
+  
+  stat_summary_hex(bins = 75, fun = mean) +
+  
+  scale_fill_gradient(low = "blue", 
+                      high = "red", 
+                      limits = c(0, 1), 
+                      name = "Called Strike Probability") +
+  
+  # Strike Zone
+  annotate("rect", 
+           xmin = -0.708,
+           xmax = 0.708,
+           ymin = 1.5,
+           ymax = 3.5,
+           color = 'black',
+           linetype = 'longdash',
+           linewidth = 1,
+           fill = NA) +
+  
+  # Home Plate
+  annotate("segment", 
+           x = -0.708, y = 0, 
+           xend = 0.708, yend = 0, 
+           color = 'black') +
+  annotate("segment", 
+           x = -0.708, y = 0, 
+           xend = -0.708, yend = -0.3, 
+           color = 'black') +
+  annotate("segment", 
+           x = 0.708, y = 0, 
+           xend = 0.708, yend = -0.3, 
+           color = 'black') +
+  annotate("segment", 
+           x = -0.708, y = -0.3, 
+           xend = 0, yend = -0.6, 
+           color = 'black') +
+  annotate("segment", 
+           x = 0.708, y = -0.3, 
+           xend = 0, yend = -0.6, 
+           color = 'black') +
+  
+  
+  # Draw attack zones (heart, shadow, chase areas approximation)
+  annotate("rect", 
+           xmin = -0.558, xmax = 0.558, 
+           ymin = 1.833, ymax = 3.166, 
+           color = 'green', linetype = 'solid', 
+           fill = NA, size = 1) +
+  annotate("rect", 
+           xmin = -1.108, xmax = 1.108, 
+           ymin = 1.166, ymax = 3.833, 
+           color = 'cyan', linetype = 'solid', 
+           fill = NA, size = 1) +
+  annotate("rect", 
+           xmin = -1.666, xmax = 1.666, 
+           ymin = 0.5, ymax = 4.5, 
+           color = 'orange', linetype = 'solid', 
+           fill = NA, size = 1) +
+  
+  xlim(-2.5, 2.5) +
+  ylim(-1, 5.5) +
+  coord_fixed() +
+  theme_minimal() +
+  theme(legend.position = c(1.3, 1),
+        legend.justification = c(1, 1),
+        legend.box.just = "right",
+        legend.key = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank()) +
+  theme(axis.line = element_blank(), 
+        axis.ticks = element_blank(),
+        panel.grid = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(fill = "Called Strike Probability", 
+       color = "Outcome", 
+       shape = "Attack Zone")
+
+
+
+
+
+
+
+
+
+
+
+
+
+## GAM for Smooth Effects (Pitch Location) --------------------------------
+gam_location <- gam(is_strike ~ s(plate_location_x, plate_location_z),
+                    family = binomial(link = "logit"), 
+                    data = pitch_data_clean,
+                    control = gam.control(trace = TRUE))
+
+summary(gam_location)
+
+
+pitch_data_clean <- pitch_data_clean %>%
+  mutate(strike_prob = predict(gam_location, type = "response"))
+
+
+
+
+
+## GLMER for Random Effects (Batter, Pitcher, Catcher, Umpire) ------------
+glmer_rand_effects <- glmer(is_strike ~ strike_prob +
+                              (1|batterid) +
+                              #(1|pitcherid) +
+                              (1|cid) +
+                              (1|hp_umpid),
+                            data = pitch_data_clean,
+                            family = binomial(link = "logit"))
+summary(glmer_rand_effects)
+
+
+
+# Function to extract and rename random effects
+extract_random_effects <- function(effect_name, ranef_object) {
+  ranef_df <- as.data.frame(ranef(ranef_object)[[effect_name]])
+  ranef_df <- rownames_to_column(ranef_df, effect_name)
+  colnames(ranef_df)[2] <- paste0(effect_name, "_effect")
+  return(ranef_df)
+}
+
+
+# Append random effects to pitch data
+pitch_data_clean <- reduce(
+  map(c("batterid", "cid", "hp_umpid"),
+      ~ extract_random_effects(.x, glmer_rand_effects)),
+  ~ left_join(.x, .y, by = names(.y)[1]),
+  .init = pitch_data_clean)
+
+
+
+
+
+## XGBoost Model ----------------------------------------------------------
+
+# Counts and RE instead of Leverage Index, no pitcher effect
+# tuned brier = 0.03118091
+features <- c("plate_location_x", "plate_location_z",
+              "spin_rate", "rel_speed", 
+              "induced_vert_break", "horizontal_break",
+              "is_lhp", "is_lhb",
+              "batting_team_diff", 
+              "inning_stage", "is_bottom", 
+              "balls", "strikes", "leverage_index", 
+              "batterid_effect", "cid_effect", "hp_umpid_effect")
+
+
+# Counts and RE instead of Leverage Index
+# initial brier = 0.00819
+# tuned brier = 0.03133446
+features <- c("plate_location_x", "plate_location_z",
+              "spin_rate", "rel_speed", 
+              "induced_vert_break", "horizontal_break",
+              "is_lhp", "is_lhb",
+              "batting_team_diff", 
+              "inning_stage", "is_bottom", 
+              "balls", "strikes", "run_exp_before", 
+              "batterid_effect", "pitcherid_effect",
+              "cid_effect", "hp_umpid_effect")
+
+
+# initial brier = 0.00819
+# tuned brier = 0.03479761
+features <- c("plate_location_x", "plate_location_z",
+              "spin_rate", "rel_speed", 
+              "induced_vert_break", "horizontal_break",
+              "is_lhp", "is_lhb",
+              "batting_team_diff", 
+              "inning_stage", "is_bottom", 
+              "leverage_index", 
+              "batterid_effect", "pitcherid_effect",
+              "cid_effect", "hp_umpid_effect")
+
+
+# Prep data for XGBoost
+X <- model.matrix(~ . - 1, data = pitch_data_clean[, features])
+y <- pitch_data_clean$is_strike
+dtrain <- xgb.DMatrix(data = X, label = y)
+
+
+# Set parameters for XGBoost
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",   
+  max_depth = 10,
+  eta = 0.1,
+  nthread = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8
+  )
+
+
+# Train XGBoost model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 200,
+  watchlist = list(train = dtrain),
+  print_every_n = 10
+  )
+
+
+# Feature importance
+importance <- xgb.importance(feature_names = colnames(X), 
+                             model = xgb_model)
+print(importance)
+xgb.plot.importance(importance)
+
+
+# K-fold Cross-Validation
+set.seed(12345)
+cv_model <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 500,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 10,
+  print_every_n = 10
+  )
+
+
+# LogLoss Plot
+ggplot(melt(as.data.frame(cbind(
+  Iteration = 1:nrow(cv_model$evaluation_log),
+  TrainLogLoss = cv_model$evaluation_log$train_logloss_mean,
+  TestLogLoss = cv_model$evaluation_log$test_logloss_mean)), 
+  id.vars = "Iteration",
+  variable.name = "Dataset",
+  value.name = "LogLoss"), 
+       aes(x = Iteration, y = LogLoss, color = Dataset)) +
+  geom_line(size = 1) +  
+  labs(title = "XGBoost LogLoss Across Iterations", 
+       x = "Iteration", 
+       y = "LogLoss") +
+  theme_minimal() +  
+  scale_color_manual(values = c("TrainLogLoss" = "blue", 
+                                "TestLogLoss" = "red")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.title = element_text(face = "bold", size = 12),
+        legend.title = element_blank(),  
+        legend.position = "top") 
+
+
+
+## Hyperparameter Tuning: Bayesian Optimization ---------------------------
+set.seed(567891)
+opt_result <- bayesOpt(
+  FUN = function(nrounds, max_depth, eta, subsample, colsample_bytree,
+                 lambda, alpha) {
+    params_tuned <- list(
+      booster = "gbtree",
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = max_depth,
+      eta = eta,
+      subsample = subsample,
+      colsample_bytree = colsample_bytree,
+      lambda = lambda,
+      alpha = alpha
+    )
+    cv_result <- xgb.cv(
+      params = params_tuned,
+      data = dtrain,
+      nfold = 5,
+      nrounds = nrounds,
+      verbose = 0
+    )
+    list(Score = -min(cv_result$evaluation_log$test_logloss_mean))
+  },
+  bounds <- list(
+    nrounds = c(50L, 500L),
+    eta = c(0.001, 0.3),
+    max_depth = c(1L, 10L),
+    colsample_bytree = c(0.5, 1),
+    subsample = c(0.1, 1),
+    lambda = c(1, 10),
+    alpha = c(1, 1.01)
+    ),
+  initPoints = 25,
+  plotProgress = TRUE
+  )
+
+
+tuned_params <- append(list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",  
+  nthread = 4),
+  getBestPars(opt_result)
+  )
+  
+
+
+
+
+## Hyperparameter Tuning: Grid Search (Not used in Final) -----------------
+xgb_grid <- expand.grid(
+  nrounds = c(50, 100, 150),
+  max_depth = c(6, 8, 10),
+  eta = c(0.1, 0.3),
+  gamma = 0,
+  colsample_bytree = c(0.5, 0.9),
+  min_child_weight = c(1, 3),
+  subsample = 0.8
+  )
+
+train_control <- trainControl(
+  method = "cv",
+  number = 5,
+  verboseIter = TRUE,
+  allowParallel = TRUE
+  )
+
+xgb_tune <- train(
+  x = X,
+  y = y,
+  method = "xgbTree",
+  trControl = train_control,
+  tuneGrid = xgb_grid,
+  metric = "logloss"
+  )
+
+
+tuned_params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "logloss",   
+  max_depth = xgb_tune$bestTune$max_depth,
+  eta = xgb_tune$bestTune$eta,
+  nthread = 4,
+  subsample = xgb_tune$bestTune$subsample,
+  min_child_weight = xgb_tune$bestTune$min_child_weight,
+  colsample_bytree = xgb_tune$bestTune$colsample_bytree
+  )
+
+
+tuned_xgb_model <- xgb.train(
+  params = tuned_params,
+  data = dtrain,
+  nrounds = xgb_tune$bestTune$nrounds,
+  watchlist = list(train = dtrain),
+  print_every_n = 10
+  )
+
+
+
+
+
+## Re-fitting Tuned XGBoost Model -----------------------------------------
+# K-fold Cross-Validation
+set.seed(9873)
+tuned_cv_model <- xgb.cv(
+  params = tuned_params,
+  data = dtrain,
+  nrounds = tuned_params$nrounds,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 10,
+  print_every_n = 10
+  )
+
+
+# Tuned LogLoss Plot
+ggplot(melt(as.data.frame(cbind(
+  Iteration = 1:nrow(tuned_cv_model$evaluation_log),
+  TrainLogLoss = tuned_cv_model$evaluation_log$train_logloss_mean,
+  TestLogLoss = tuned_cv_model$evaluation_log$test_logloss_mean)), 
+  id.vars = "Iteration",
+  variable.name = "Dataset",
+  value.name = "LogLoss"), 
+  aes(x = Iteration, y = LogLoss, color = Dataset)) +
+  geom_line(size = 1) +  
+  labs(title = "XGBoost LogLoss Across Iterations", 
+       x = "Iteration", 
+       y = "LogLoss") +
+  theme_minimal() +  
+  scale_color_manual(values = c("TrainLogLoss" = "blue", 
+                                "TestLogLoss" = "red")) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+        axis.title = element_text(face = "bold", size = 12),
+        legend.title = element_blank(),  
+        legend.position = "top") 
+
+
+# Final Tuned Model using tuned hyperparams
+tuned_xgb_model <- xgb.train(
+  params = tuned_params,
+  data = dtrain,
+  nrounds = tuned_cv_model$best_iteration,
+  watchlist = list(train = dtrain),
+  print_every_n = 10
+  )
+
+
+# Tuned Feature importance
+tuned_importance <- xgb.importance(feature_names = colnames(X), 
+                             model = tuned_xgb_model)
+print(tuned_importance)
+xgb.plot.importance(tuned_importance)
+
+
+# The ranked features by mean |SHAP|
+shap_values <- shap.values(xgb_model = tuned_xgb_model, X_train = X)
+shap_values$mean_shap_score
+
+
+
+# Save the final model predictions in the data
+pitch_results <- pitch_data_clean %>%
+  mutate(called_strike_prob = predict(tuned_xgb_model, newdata = dtrain),
+         sq_err = (called_strike_prob - is_strike)^2)
+
+brier_score <- mean((pitch_results$called_strike_prob - 
+                       pitch_results$is_strike) ^ 2)
+
+pitch_results %>%
+  filter(attack_zone == "shadow") %>%
+  arrange(desc(sq_err)) %>%
+  head()
+
+pitch_results %>%
+  filter(attack_zone == "shadow") %>%
+  arrange(desc(called_strike_prob)) %>%
+  head()
+
+
+# Final Result
+pitch_data_pred <- pitch_data %>%
+  left_join(pitch_results %>%
+              select(pitch_id, called_strike_prob), 
+            by = "pitch_id")
+
+write.csv(pitch_data_pred, "pitch_data_pred.csv")
+
+
