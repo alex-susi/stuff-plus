@@ -276,6 +276,7 @@ feature_engineering <- function(df) {
   # Final cleaning
   df <- df %>%
     relocate(pitch_name, .after = pitch_number) %>%
+    mutate(is_primary = if_else(primary_pitch_type == pitch_type, 1, 0)) %>%
     arrange(game_date, game_id, inning, at_bat_number, pitch_number) %>%
     select(-.groups)
   
@@ -439,6 +440,7 @@ data_all %>%
 # arm_angle_diff
 # VAAAA
 # HAAAA
+# is_primary
 
 # Group by pitch_class
 
@@ -449,35 +451,38 @@ data_all %>%
 
 ## Splitting Data --------------------------------------------------------------------
 
-train <- data_all %>%
-  filter(year %in% c(2020, 2021, 2022))
-
-test <- data_all %>%
-  filter(year %in% c(2023, 2024))
-
-
-train_fb <- train %>%
+# Train
+train_fb <- data_all %>%
+  filter(year %in% c(2020, 2021, 2022)) %>%
   filter(pitch_class == "Fastball")
 
-train_bb <- train %>%
+train_bb <- data_all %>%
+  filter(year %in% c(2020, 2021, 2022)) %>%
   filter(pitch_class == "Breaking Ball")
 
-train_off <- train %>%
+train_off <- data_all %>%
+  filter(year %in% c(2020, 2021, 2022)) %>%
   filter(pitch_class == "Offspeed")
 
-test_fb <- test %>%
+
+# Test
+test_fb <- data_all %>%
+  filter(year %in% c(2023, 2024)) %>%
   filter(pitch_class == "Fastball")
 
-test_bb <- test %>%
+test_bb <- data_all %>%
+  filter(year %in% c(2023, 2024)) %>%
   filter(pitch_class == "Breaking Ball")
 
-test_off <- test %>%
+test_off <- data_all %>%
+  filter(year %in% c(2023, 2024)) %>%
   filter(pitch_class == "Offspeed")
 
 
 features <- c("release_speed_mph", "release_spin_rate", "extension",
               "ax", "az", "release_speed_diff", "ax_diff", "az_diff",
-              "arm_angle_diff", "VAAAA", "HAAAA")
+              "arm_angle_diff", "VAAAA", "HAAAA", "is_primary")
+
 
 # Set XGBoost parameters
 params <- list(
@@ -521,14 +526,14 @@ xgb.plot.importance(importance_fb)
 
 # Hyperparameter Tuning
 param_grid_fb <- expand.grid(
-  nrounds = c(100, 250, 500),           # Reduced range for boosting rounds
-  eta = c(0.1, 0.2, 0.3),                      # Coarser learning rate grid
-  max_depth = c(2, 6, 10),                      # Key depths, avoiding very deep trees
-  colsample_bytree = c(0.5, 0.75, 1),          # Coarser grid for feature subsampling
-  subsample = c(0.6, 0.8, 1),                  # Focused range for row subsampling
-  min_child_weight = c(1, 10, 50),             # Coarse grid for minimum child weight
-  lambda = c(1),                               # Fixing L2 regularization
-  alpha = c(1)                                 # Fixing L1 regularization
+  nrounds = c(100, 250, 500),          # Reduced range for boosting rounds
+  eta = c(0.1, 0.2, 0.3),              # Coarser learning rate grid
+  max_depth = c(2, 6, 10),             # Key depths, avoiding very deep trees
+  colsample_bytree = c(0.5, 0.75, 1),  # Coarser grid for feature subsampling
+  subsample = c(0.6, 0.8, 1),          # Focused range for row subsampling
+  min_child_weight = c(1, 10, 50),     # Coarse grid for minimum child weight
+  lambda = c(1),                       # Fixing L2 regularization
+  alpha = c(1)                         # Fixing L1 regularization
   )
 
 
@@ -703,14 +708,14 @@ xgb.plot.importance(importance_bb)
 
 # Hyperparameter Tuning
 param_grid_bb <- expand.grid(
-  nrounds = c(100, 250, 500),           # Reduced range for boosting rounds
-  eta = c(0.1, 0.2, 0.3),                      # Coarser learning rate grid
-  max_depth = c(2, 6, 10),                      # Key depths, avoiding very deep trees
-  colsample_bytree = c(0.5, 0.75, 1),          # Coarser grid for feature subsampling
-  subsample = c(0.6, 0.8, 1),                  # Focused range for row subsampling
-  min_child_weight = c(1, 10, 50),             # Coarse grid for minimum child weight
-  lambda = c(1),                               # Fixing L2 regularization
-  alpha = c(1)                                 # Fixing L1 regularization
+  nrounds = c(100, 250, 500),          # Reduced range for boosting rounds
+  eta = c(0.1, 0.2, 0.3),              # Coarser learning rate grid
+  max_depth = c(2, 6, 10),             # Key depths, avoiding very deep trees
+  colsample_bytree = c(0.5, 0.75, 1),  # Coarser grid for feature subsampling
+  subsample = c(0.6, 0.8, 1),          # Focused range for row subsampling
+  min_child_weight = c(1, 10, 50),     # Coarse grid for minimum child weight
+  lambda = c(1),                       # Fixing L2 regularization
+  alpha = c(1)                         # Fixing L1 regularization
 )
 
 
@@ -885,14 +890,14 @@ xgb.plot.importance(importance_off)
 
 # Hyperparameter Tuning
 param_grid_off <- expand.grid(
-  nrounds = c(100, 250, 500),           # Reduced range for boosting rounds
-  eta = c(0.1, 0.2, 0.3),                      # Coarser learning rate grid
-  max_depth = c(2, 6, 10),                      # Key depths, avoiding very deep trees
-  colsample_bytree = c(0.5, 0.75, 1),          # Coarser grid for feature subsampling
-  subsample = c(0.6, 0.8, 1),                  # Focused range for row subsampling
-  min_child_weight = c(1, 10, 50),             # Coarse grid for minimum child weight
-  lambda = c(1),                               # Fixing L2 regularization
-  alpha = c(1)                                 # Fixing L1 regularization
+  nrounds = c(100, 250, 500),          # Reduced range for boosting rounds
+  eta = c(0.1, 0.2, 0.3),              # Coarser learning rate grid
+  max_depth = c(2, 6, 10),             # Key depths, avoiding very deep trees
+  colsample_bytree = c(0.5, 0.75, 1),  # Coarser grid for feature subsampling
+  subsample = c(0.6, 0.8, 1),          # Focused range for row subsampling
+  min_child_weight = c(1, 10, 50),     # Coarse grid for minimum child weight
+  lambda = c(1),                       # Fixing L2 regularization
+  alpha = c(1)                         # Fixing L1 regularization
 )
 
 
