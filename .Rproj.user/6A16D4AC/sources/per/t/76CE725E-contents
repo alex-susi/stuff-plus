@@ -2,12 +2,16 @@ source("Statcast Scraper.R")
 library(mgcv)
 library(xgboost)
 library(foreach)
+library(SHAPforxgboost)
+library(parallel)
 
 
+# Feature Engineering ----------------------------------------------------------------
 feature_engineering <- function(df) {
   
   # Mapping system
   pitch_mapping <- list(
+    
     # Fastballs
     "4-Seam Fastball" = "Fastball",
     "Sinker" = "Fastball",
@@ -35,9 +39,10 @@ feature_engineering <- function(df) {
     "Slow Curve" = "Other"
   )
   
+  
+  # Map pitch_name to cleaned pitch type
   df <- df %>%
     mutate(
-      # Map pitch_name to cleaned pitch type
       pitch_class = recode(pitch_name, !!!pitch_mapping)
       ) %>%
     filter(pitch_class != "Other")
@@ -198,13 +203,6 @@ feature_engineering <- function(df) {
     mutate(delta_run_exp_mean = mean(delta_run_exp, na.rm = TRUE), 
            .groups = "drop")
   
-  # Define the pitch types to be considered as primary candidates
-  #primary_pitch_types <- c("SI", "FF", "FC")
-  
-  # Filter the DataFrame to include only the specified primary pitch types
-  #df_filtered <- df %>%
-   # filter(pitch_type %in% primary_pitch_types)
-  
   
   # Define primary pitch based on highest usage by batter handedness and year
   df_primary <- df %>%
@@ -237,14 +235,17 @@ feature_engineering <- function(df) {
   
   # Calculate pitch differentials compared to primary pitch
   df <- df %>%
+    mutate(is_primary = if_else(primary_pitch_type == pitch_type, 1, 0)) %>%
     mutate(
-      release_speed_diff = release_speed_mph - avg_release_speed,
-      az_diff = az - avg_az,
-      ax_diff = abs(ax - avg_ax),
-      ivb_diff = pfx_z - avg_ivb,
-      hb_diff = abs(api_break_x_arm - avg_hb),
-      arm_angle_diff = arm_angle - avg_arm_angle
-      )
+      release_speed_diff = if_else(is_primary == 1, 0, 
+                                   release_speed_mph - avg_release_speed),
+      az_diff = if_else(is_primary == 1, 0, az - avg_az),
+      ax_diff = if_else(is_primary == 1, 0, abs(ax - avg_ax)),
+      ivb_diff = if_else(is_primary == 1, 0, pfx_z - avg_ivb),
+      hb_diff = if_else(is_primary == 1, 0, abs(api_break_x_arm - avg_hb)),
+      arm_angle_diff = if_else(is_primary == 1, 0, arm_angle - avg_arm_angle)
+    )
+  
   
   
   # Replace missing values for pitchers without a primary pitch defined
@@ -276,7 +277,9 @@ feature_engineering <- function(df) {
   # Final cleaning
   df <- df %>%
     relocate(pitch_name, .after = pitch_number) %>%
-    mutate(is_primary = if_else(primary_pitch_type == pitch_type, 1, 0)) %>%
+    relocate(pitch_class, .after = pitch_type) %>%
+    relocate(VAAAA, .after = VAA) %>%
+    relocate(HAAAA, .after = HAA) %>%
     arrange(game_date, game_id, inning, at_bat_number, pitch_number) %>%
     select(-.groups)
   
@@ -311,11 +314,11 @@ data_2024 %>%
   group_by(pitch_result) %>%
   summarise(n = n())
 
+data_2024 %>%
+  group_by(pitch_name) %>%
+  summarise(n = n()) %>%
+  as.data.frame()
 
-data_all %>%
-  filter(pitcher_name == "Chapman, Aroldis") %>%
-  arrange(desc(VAA)) %>%
-  head()
 
 
 # VAAAA and HAAAA Leaders
@@ -334,13 +337,6 @@ data_all %>%
             VAAAA = mean(VAAAA)) %>%
   arrange(desc(VAAAA)) %>%
   as.data.frame()
-
-
-data_2024 %>%
-  group_by(pitch_name) %>%
-  summarise(n = n()) %>%
-  as.data.frame()
-
 
 
 
@@ -371,33 +367,6 @@ data_2024 %>%
     ) %>%
   as.data.frame() %>%
   write.csv("pitch_summary.csv")
-
-
-
-data_2024 %>%
-  filter(pitch_name == "Screwball") %>%
-  distinct(pitcher_name)
-
-
-data_2024 %>%
-  filter(pitcher_name == "Senga, Kodai") %>%
-  distinct(pitch_name)
-
-
-
-
-
-
-
-data_2024 %>%
-  summarise(across(everything(), ~ sum(is.na(.)), .names = "na_{.col}")) %>%
-  pivot_longer(cols = everything(), 
-               names_to = "column_name", 
-               values_to = "na_count") %>%
-  mutate(column_name = sub("^na_", "", column_name)) %>%
-  filter(na_count > 0) %>%
-  as.data.frame()
-
 
 
 
@@ -490,12 +459,17 @@ params <- list(
   objective = "reg:squarederror",
   eval_metric = "rmse",   
   max_depth = 10,
-  eta = 0.1,
+  eta = 0.3,
   nthread = -1,
   subsample = 0.8,
   colsample_bytree = 0.8,
-  min_child_weight = 20
+  min_child_weight = 0
   )
+
+
+
+
+
 
 
 
@@ -526,40 +500,51 @@ xgb.plot.importance(importance_fb)
 
 # Hyperparameter Tuning
 param_grid_fb <- expand.grid(
-  nrounds = c(100, 250, 500),          # Reduced range for boosting rounds
-  eta = c(0.1, 0.2, 0.3),              # Coarser learning rate grid
-  max_depth = c(2, 6, 10),             # Key depths, avoiding very deep trees
-  colsample_bytree = c(0.5, 0.75, 1),  # Coarser grid for feature subsampling
-  subsample = c(0.6, 0.8, 1),          # Focused range for row subsampling
-  min_child_weight = c(1, 10, 50),     # Coarse grid for minimum child weight
-  lambda = c(1),                       # Fixing L2 regularization
-  alpha = c(1)                         # Fixing L1 regularization
+  nrounds = c(50, 100, 250),            # Reduced range for boosting rounds
+  eta = c(0.3, 0.6, 0.9),               # Coarser learning rate grid
+  max_depth = c(1, 6, 12),              # Key depths, avoiding very deep trees
+  colsample_bytree = c(0.2, 0.6, 1.0),  # Coarser grid for feature subsampling
+  subsample = c(0.2, 0.6, 1),           # Focused range for row subsampling
+  min_child_weight = c(1, 10, 50),      # Coarse grid for minimum child weight
+  lambda = c(1),                        # Fixing L2 regularization
+  alpha = c(1)                          # Fixing L1 regularization
   )
 
 
+
+
+# Detect number of CPU cores
+num_cores <- parallel::detectCores()
+
+# Create a cluster for parallel grid search
+cluster <- parallel::makeCluster(num_cores)
+clusterEvalQ(cluster, library(xgboost))  # Load XGBoost on all worker nodes
+
 # Randomly select 50 combinations
-sampled_grid <- param_grid_fb[sample(nrow(param_grid_fb), 50), ]
+sampled_grid <- param_grid_fb[sample(nrow(param_grid_fb), 600), ]
 
+train_fb_sub <- train_fb[sample(1:nrow(train_fb), 100000), ]
 
-cluster <- parallel::makeCluster(parallel::detectCores())
+# Export necessary objects to worker nodes
+clusterExport(cluster, c("sampled_grid", "train_fb_sub", "num_cores", "features"))
 
-
-
-# Initialize results list
-results_fb <- list()
-
-dtrain_fb_sub <- dtrain_fb[sample(1:nrow(dtrain_fb), 100000), ]
-
-# Perform grid search for sampled parameters
-for (i in seq_len(nrow(sampled_grid))) {
+# Define function to train each model in parallel
+run_xgb_cv <- function(i) {
   params_tuned_fb <- as.list(sampled_grid[i, ])
   params_tuned_fb <- append(params_tuned_fb, list(
     booster = "gbtree",
     objective = "reg:squarederror",
-    eval_metric = "rmse"
-    ))
+    eval_metric = "rmse",
+    nthread = num_cores  # Use all CPU cores for training each model
+  ))
   
-  # Cross-validation with early stopping
+  # Re-create training data inside worker node
+  dtrain_fb_sub <- xgb.DMatrix(
+    data = model.matrix(~ . - 1, data = train_fb_sub[, features]),
+    #data = model.matrix(~ . - 1, data = train_fb[, features]),
+    label = train_fb_sub$delta_run_exp_mean)
+  
+  # Run XGBoost cross-validation
   cv_result <- xgb.cv(
     params = params_tuned_fb,
     data = dtrain_fb_sub,
@@ -567,17 +552,29 @@ for (i in seq_len(nrow(sampled_grid))) {
     nfold = 5,
     early_stopping_rounds = 10,
     verbose = 0
-    )
+  )
   
-  # Store results
-  results_fb[[i]] <- list(
+  # Return results
+  list(
     params = params_tuned_fb,
     rmse = min(cv_result$evaluation_log$test_rmse_mean)
-    )
-  }
+  )
+}
 
+# Measure execution time
+start_time <- Sys.time()
 
-parallel::stopCluster(cluster)
+# Run grid search in parallel (one model per core)
+results_fb <- parLapply(cluster, seq_len(nrow(sampled_grid)), run_xgb_cv)
+
+# Stop parallel cluster
+stopCluster(cluster)
+
+end_time <- Sys.time()
+print(paste("Total training time:", 
+            round(difftime(end_time, start_time, units = "mins"), 2), 
+            "minutes"))
+
 
 
 # Get the best parameters
@@ -633,6 +630,7 @@ test_fb_2024 <- test_fb %>%
   mutate(delta_run_exp_mean = predict(xgb_model_fb_tuned, 
                                       newdata = as.matrix(select(., all_of(features)))))
 
+
 ## 2023 Stuff+ ##
 # Calculate the mean and standard deviation of the delta_run_exp_mean column for 2023
 fb_target_mean <- mean(test_fb_2023$delta_run_exp_mean, na.rm = TRUE)
@@ -655,6 +653,7 @@ fb_agg_2023 <- test_fb_2023 %>%
     ) %>%
   as.data.frame()
 
+
 ## 2024 Stuff+ ##
 # Standardize the delta_run_exp_mean column to create a z-score 
 # for 2024 using 2023 mean and std
@@ -673,6 +672,16 @@ fb_agg_2024 <- test_fb_2024 %>%
     .groups = "drop"
   ) %>%
   as.data.frame()
+
+
+
+fb_agg_2024 %>% 
+  arrange(desc(mean_stuff_plus)) %>%
+  head(n = 20)
+
+fb_agg_2024 %>% 
+  filter(pitcher_name == "Clase, Emmanuel") %>%
+  head(n = 20)
 
 
 
@@ -708,40 +717,51 @@ xgb.plot.importance(importance_bb)
 
 # Hyperparameter Tuning
 param_grid_bb <- expand.grid(
-  nrounds = c(100, 250, 500),          # Reduced range for boosting rounds
-  eta = c(0.1, 0.2, 0.3),              # Coarser learning rate grid
-  max_depth = c(2, 6, 10),             # Key depths, avoiding very deep trees
-  colsample_bytree = c(0.5, 0.75, 1),  # Coarser grid for feature subsampling
-  subsample = c(0.6, 0.8, 1),          # Focused range for row subsampling
-  min_child_weight = c(1, 10, 50),     # Coarse grid for minimum child weight
-  lambda = c(1),                       # Fixing L2 regularization
-  alpha = c(1)                         # Fixing L1 regularization
+  nrounds = c(50, 100, 250),            # Reduced range for boosting rounds
+  eta = c(0.3, 0.6, 0.9),               # Coarser learning rate grid
+  max_depth = c(1, 6, 12),              # Key depths, avoiding very deep trees
+  colsample_bytree = c(0.2, 0.6, 1.0),  # Coarser grid for feature subsampling
+  subsample = c(0.2, 0.6, 1),           # Focused range for row subsampling
+  min_child_weight = c(1, 10, 50),      # Coarse grid for minimum child weight
+  lambda = c(1),                        # Fixing L2 regularization
+  alpha = c(1)                          # Fixing L1 regularization
 )
 
 
+
+
+# Detect number of CPU cores
+num_cores <- parallel::detectCores()
+
+# Create a cluster for parallel grid search
+cluster <- parallel::makeCluster(num_cores)
+clusterEvalQ(cluster, library(xgboost))  # Load XGBoost on all worker nodes
+
 # Randomly select 50 combinations
-sampled_grid <- param_grid_bb[sample(nrow(param_grid_bb), 50), ]
+sampled_grid <- param_grid_bb[sample(nrow(param_grid_bb), 600), ]
 
+train_bb_sub <- train_bb[sample(1:nrow(train_bb), 100000), ]
 
-cluster <- parallel::makeCluster(parallel::detectCores())
+# Export necessary objects to worker nodes
+clusterExport(cluster, c("sampled_grid", "train_bb_sub", "num_cores", "features"))
 
-
-
-# Initialize results list
-results_bb <- list()
-
-dtrain_bb_sub <- dtrain_bb[sample(1:nrow(dtrain_bb), 100000), ]
-
-# Perform grid search for sampled parameters
-for (i in seq_len(nrow(sampled_grid))) {
+# Define function to train each model in parallel
+run_xgb_cv <- function(i) {
   params_tuned_bb <- as.list(sampled_grid[i, ])
   params_tuned_bb <- append(params_tuned_bb, list(
     booster = "gbtree",
     objective = "reg:squarederror",
-    eval_metric = "rmse"
+    eval_metric = "rmse",
+    nthread = num_cores  # Use all CPU cores for training each model
   ))
   
-  # Cross-validation with early stopping
+  # Re-create training data inside worker node
+  dtrain_bb_sub <- xgb.DMatrix(
+    data = model.matrix(~ . - 1, data = train_bb_sub[, features]),
+    #data = model.matrix(~ . - 1, data = train_bb[, features]),
+    label = train_bb_sub$delta_run_exp_mean)
+  
+  # Run XGBoost cross-validation
   cv_result <- xgb.cv(
     params = params_tuned_bb,
     data = dtrain_bb_sub,
@@ -751,21 +771,33 @@ for (i in seq_len(nrow(sampled_grid))) {
     verbose = 0
   )
   
-  # Store results
-  results_bb[[i]] <- list(
+  # Return results
+  list(
     params = params_tuned_bb,
     rmse = min(cv_result$evaluation_log$test_rmse_mean)
   )
 }
 
+# Measure execution time
+start_time <- Sys.time()
 
-parallel::stopCluster(cluster)
+# Run grid search in parallel (one model per core)
+results_bb <- parLapply(cluster, seq_len(nrow(sampled_grid)), run_xgb_cv)
+
+# Stop parallel cluster
+stopCluster(cluster)
+
+end_time <- Sys.time()
+print(paste("Total training time:", 
+            round(difftime(end_time, start_time, units = "mins"), 2), 
+            "minutes"))
+
 
 
 # Get the best parameters
 best_params_bb <- do.call(rbind, lapply(results_bb, function(res) {
   c(res$params, rmse = res$rmse)
-  })) %>%
+})) %>%
   as_tibble() %>%
   arrange(as.numeric(rmse)) %>%
   as.data.frame()
@@ -783,7 +815,7 @@ best_params_bb <- list(
   min_child_weight = best_params_bb$min_child_weight[[1]],
   lambda = 1,
   alpha = 1
-  )
+)
 
 
 # Re-run model with tuned parameters
@@ -793,7 +825,7 @@ xgb_model_bb_tuned <- xgb.train(
   nrounds = best_params_bb$nrounds[[1]],
   watchlist = list(train = dtrain_bb),
   print_every_n = 50
-  )
+)
 
 
 # Tuned Feature Importance
@@ -814,6 +846,7 @@ test_bb_2024 <- test_bb %>%
   filter(year == 2024) %>%
   mutate(delta_run_exp_mean = predict(xgb_model_bb_tuned, 
                                       newdata = as.matrix(select(., all_of(features)))))
+
 
 ## 2023 Stuff+ ##
 # Calculate the mean and standard deviation of the delta_run_exp_mean column for 2023
@@ -837,6 +870,7 @@ bb_agg_2023 <- test_bb_2023 %>%
   ) %>%
   as.data.frame()
 
+
 ## 2024 Stuff+ ##
 # Standardize the delta_run_exp_mean column to create a z-score 
 # for 2024 using 2023 mean and std
@@ -855,6 +889,16 @@ bb_agg_2024 <- test_bb_2024 %>%
     .groups = "drop"
   ) %>%
   as.data.frame()
+
+
+
+bb_agg_2024 %>% 
+  arrange(desc(mean_stuff_plus)) %>%
+  head(n = 20)
+
+bb_agg_2024 %>% 
+  filter(pitcher_name == "Clase, Emmanuel") %>%
+  head(n = 20)
 
 
 

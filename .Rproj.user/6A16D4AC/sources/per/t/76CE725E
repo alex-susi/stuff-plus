@@ -3,7 +3,7 @@
     "path": "C:/Users/alexs/Desktop/Data Science Projects/stuff-plus/stuff_plus.R",
     "project_path": "stuff_plus.R",
     "type": "r_source",
-    "hash": "2422654462",
+    "hash": "3245414595",
     "contents": "",
     "dirty": false,
     "created": 1732582018834.0,
@@ -12,15 +12,15 @@
     "properties": {
         "source_window_id": "",
         "Source": "Source",
-        "cursorPosition": "1040,0",
-        "scrollLine": "0"
+        "cursorPosition": "1086,0",
+        "scrollLine": "1044"
     },
     "folds": "",
-    "lastKnownWriteTime": 1737134787,
+    "lastKnownWriteTime": 1738196498,
     "encoding": "UTF-8",
     "collab_server": "",
     "source_window": "",
-    "last_content_update": 1737134787291,
+    "last_content_update": 1738196499031,
     "read_only": false,
     "read_only_alternatives": []
 }
